@@ -26,6 +26,12 @@ RUN grep -vE "^torch==|^torchvision==" requirements.txt \
 
 COPY . .
 
+RUN python -c "\
+import urllib.request, os; \
+urllib.request.urlretrieve(\
+'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task',\
+'pose_landmarker_heavy.task')"
+
 EXPOSE 5000
 
 CMD ["python", "app.py"]
