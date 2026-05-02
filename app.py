@@ -1,4 +1,5 @@
 import cv2
+import logging
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
@@ -10,9 +11,21 @@ import urllib.request
 import os
 
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+# Suppress noisy startup warnings from third-party libraries
+logging.getLogger("timm").setLevel(logging.ERROR)
+logging.getLogger("torch").setLevel(logging.ERROR)
+
 app = Flask(__name__)
 
-# COCO keypoint indices — same values as the legacy mediapipe pose API
+# Limit uploads to 25 MB per request (two full-res phone photos)
+app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
+
+# ── Pose landmark indices ────────────────────────────────────────────────────
+# COCO keypoint indices — same numbering as the legacy mediapipe pose API.
+# Used throughout to access specific body landmarks from the detection result.
 class PoseLandmark:
     NOSE = 0
     LEFT_EAR = 7
@@ -29,6 +42,9 @@ class PoseLandmark:
     RIGHT_ANKLE = 28
 
 
+# ── Pose landmarker setup ────────────────────────────────────────────────────
+# Downloads the heavy model on first run if not cached locally.
+# IMAGE mode processes one frame at a time (no streaming/video tracking).
 MODEL_PATH = "pose_landmarker_heavy.task"
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
@@ -36,9 +52,9 @@ MODEL_URL = (
 )
 
 if not os.path.exists(MODEL_PATH):
-    print("Downloading pose landmarker model...")
+    log.info("Downloading pose landmarker model...")
     urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-    print("Model downloaded.")
+    log.info("Model downloaded.")
 
 _landmarker = mp_vision.PoseLandmarker.create_from_options(
     mp_vision.PoseLandmarkerOptions(
@@ -53,15 +69,25 @@ _landmarker = mp_vision.PoseLandmarker.create_from_options(
 
 
 def _detect(frame):
-    """Returns list of 33 NormalizedLandmark for the first person, or None."""
+    """
+    Run pose detection on a BGR frame.
+    Returns a list of 33 NormalizedLandmark for the first detected person,
+    or None if no person is found.
+    Each landmark has .x, .y (normalised 0–1), .z, and .visibility.
+    """
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     result = _landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
     return result.pose_landmarks[0] if result.pose_landmarks else None
 
 
-KNOWN_OBJECT_WIDTH_CM = 21.0
-FOCAL_LENGTH = 600
-DEFAULT_HEIGHT_CM = 152.0
+# ── Depth estimation setup ───────────────────────────────────────────────────
+# MiDaS (Monocular Depth Estimation) estimates relative depth from a single
+# image. Used to infer the front-to-back depth of the body at key points,
+# which improves circumference estimates (a wider/deeper body = larger girth).
+# MiDaS_small is used for speed; it resizes input to 384×384 internally.
+KNOWN_OBJECT_WIDTH_CM = 21.0  # A4 paper width — fallback reference object
+FOCAL_LENGTH = 600             # Assumed focal length when no height is provided
+DEFAULT_HEIGHT_CM = 152.0      # Fallback height when user does not provide one
 
 
 def load_depth_model():
@@ -72,11 +98,24 @@ def load_depth_model():
 depth_model = load_depth_model()
 
 
+# ── Scale calibration ────────────────────────────────────────────────────────
+
 def calibrate_focal_length(image, real_width_cm, detected_width_px):
+    """
+    Estimates focal length using a reference object of known real-world width.
+    Formula: focal_length = (pixel_width × focal_length) / real_width
+    Used only when the user's height is not available.
+    """
     return (detected_width_px * FOCAL_LENGTH) / real_width_cm if detected_width_px else FOCAL_LENGTH
 
 
 def detect_reference_object(image):
+    """
+    Fallback scale calibration when no user height is provided.
+    Finds the largest contour in the image (assumed to be a reference object
+    like an A4 sheet), and derives a pixel-to-cm scale factor from it.
+    Returns (scale_factor, focal_length).
+    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -90,6 +129,12 @@ def detect_reference_object(image):
 
 
 def estimate_depth(image):
+    """
+    Run MiDaS depth estimation on a BGR image.
+    Returns a 2D numpy array of relative depth values (not metric distances).
+    The depth map is at 384×384 resolution — coordinates must be scaled
+    before indexing into it.
+    """
     input_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) / 255.0
     input_tensor = torch.tensor(input_image, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
     input_tensor = F.interpolate(input_tensor, size=(384, 384), mode="bilinear", align_corners=False)
@@ -99,6 +144,12 @@ def estimate_depth(image):
 
 
 def calculate_distance_using_height(landmarks, image_height, user_height_cm):
+    """
+    Derives the pixel-to-cm scale factor from the user's known height.
+    Measures the pixel distance from nose (head proxy) to the lower ankle,
+    then computes how many cm each pixel represents.
+    This is more accurate than reference-object calibration.
+    """
     top_head = landmarks[PoseLandmark.NOSE].y * image_height
     bottom_foot = max(
         landmarks[PoseLandmark.LEFT_ANKLE].y,
@@ -111,6 +162,15 @@ def calculate_distance_using_height(landmarks, image_height, user_height_cm):
 
 
 def get_body_width_at_height(frame, height_px, center_x):
+    """
+    Scans a horizontal pixel row to find the body's left and right edges.
+    Converts the frame to binary (thresholded), then walks outward from
+    the body centre until hitting a dark (background) pixel.
+    Used to refine width estimates where landmarks alone are imprecise
+    (e.g. waist, where there is no direct landmark).
+    Returns width in pixels, with a minimum floor of 10% of image width
+    to avoid zero/noise results.
+    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, thresh = cv2.threshold(blur, 50, 255, cv2.THRESH_BINARY)
@@ -134,10 +194,67 @@ def get_body_width_at_height(frame, height_px, center_x):
     return width_px
 
 
-def calculate_measurements(landmarks, scale_factor, image_width, image_height, depth_map, frame=None, user_height_cm=None):
+def bmi_depth_factor(height_cm, weight_kg):
+    """
+    Returns a multiplier for depth ratios based on the user's BMI.
+
+    Circumference is estimated as an ellipse: C ≈ 2π√((a²+b²)/2)
+    where 'a' is half the visible width and 'b' is estimated depth.
+    A heavier person has proportionally more front-to-back depth relative
+    to their width, so their circumferences are larger than a lean person
+    of the same visible width would suggest.
+
+    BMI brackets and multipliers:
+      < 18.5  (underweight)  → 0.85  (shallower depth)
+      18.5–25 (normal)       → 1.0   (no adjustment)
+      25–30   (overweight)   → 1.15  (slightly deeper)
+      ≥ 30    (obese)        → 1.3   (notably deeper)
+
+    Returns 1.0 (no adjustment) if weight is not provided.
+    """
+    if not weight_kg or not height_cm:
+        return 1.0
+    bmi = weight_kg / ((height_cm / 100) ** 2)
+    if bmi < 18.5:
+        return 0.85
+    elif bmi < 25.0:
+        return 1.0
+    elif bmi < 30.0:
+        return 1.15
+    else:
+        return 1.3
+
+
+def calculate_measurements(landmarks, scale_factor, image_width, image_height, depth_map, frame=None, user_height_cm=None, user_weight_kg=None):
+    """
+    Derives all body measurements from pose landmarks.
+
+    Scale factor: if height is provided, recalibrates using the more accurate
+    height-based method. Otherwise uses the value passed in (from reference
+    object detection).
+
+    depth_factor: BMI-derived multiplier applied to all circumference depth
+    ratios. A value > 1 means the body is estimated to be proportionally
+    deeper front-to-back (larger circumferences for the same visible width).
+
+    Circumference formula (simplified ellipse approximation):
+      C ≈ 2π√((a²+b²)/2)
+    where a = half visible width, b = estimated depth (width × depth_ratio × 0.7).
+    The 0.7 factor reflects that torso depth is roughly 70% of width.
+
+    depth_ratio for each body part comes from MiDaS depth map values at that
+    landmark's pixel position, scaled to [1.0, 1.5] range. A deeper reading
+    in the depth map → higher ratio → larger estimated circumference.
+
+    scale_y / scale_x: MiDaS output is always 384×384 so image coordinates
+    must be scaled before indexing the depth map.
+    """
     if user_height_cm:
         _, scale_factor = calculate_distance_using_height(landmarks, image_height, user_height_cm)
 
+    depth_factor = bmi_depth_factor(user_height_cm, user_weight_kg)
+
+    # Precompute scale factors for mapping image coords → depth map coords
     scale_y = 384 / image_height
     scale_x = 384 / image_width
 
@@ -145,6 +262,8 @@ def calculate_measurements(landmarks, scale_factor, image_width, image_height, d
         return round(value * scale_factor, 2)
 
     def calculate_circumference(width_px, depth_ratio=1.0):
+        # Elliptical approximation: treat the cross-section as an ellipse
+        # where width is the visible axis and depth is estimated.
         width_cm = width_px * scale_factor
         estimated_depth_cm = width_cm * depth_ratio * 0.7
         half_width = width_cm / 2
@@ -158,11 +277,20 @@ def calculate_measurements(landmarks, scale_factor, image_width, image_height, d
     left_hip = landmarks[PoseLandmark.LEFT_HIP]
     right_hip = landmarks[PoseLandmark.RIGHT_HIP]
 
-    # Shoulder width
+    # ── Shoulder width ───────────────────────────────────────────────────────
+    # Landmark-to-landmark distance with a 10% correction factor — shoulders
+    # tend to be slightly underestimated from a front-facing photo because the
+    # outermost edge of the deltoid is not a tracked landmark.
     shoulder_width_px = abs(left_shoulder.x * image_width - right_shoulder.x * image_width) * 1.1
     measurements["shoulder_width"] = pixel_to_cm(shoulder_width_px)
 
-    # Chest
+    # ── Chest / bust circumference ───────────────────────────────────────────
+    # Chest is measured at 15% of the way down from shoulder to hip.
+    # Width is taken from shoulder landmarks (15% wider to account for the
+    # chest being wider than the shoulder marker positions), then refined
+    # by contour scanning if a frame is available.
+    # Depth ratio from MiDaS at the chest centre point, further scaled by
+    # the BMI depth factor.
     chest_y_ratio = 0.15
     chest_y = left_shoulder.y + (left_hip.y - left_shoulder.y) * chest_y_ratio
     chest_width_px = abs((right_shoulder.x - left_shoulder.x) * image_width) * 1.15
@@ -179,11 +307,18 @@ def calculate_measurements(landmarks, scale_factor, image_width, image_height, d
         cy_s = int(chest_y_px * scale_y)
         cx_s = int(chest_x * scale_x)
         if 0 <= cy_s < 384 and 0 <= cx_s < 384:
+            # Normalise depth value to [0,1], then shift to [1.0, 1.5].
+            # A shallower depth reading (closer to max) → lower ratio.
             chest_depth_ratio = 1.0 + 0.5 * (1.0 - depth_map[cy_s, cx_s] / np.max(depth_map))
     measurements["chest_width"] = pixel_to_cm(chest_width_px)
-    measurements["chest_circumference"] = calculate_circumference(chest_width_px, chest_depth_ratio)
+    measurements["chest_circumference"] = calculate_circumference(chest_width_px, chest_depth_ratio * depth_factor)
 
-    # Waist
+    # ── Waist circumference ──────────────────────────────────────────────────
+    # Waist is at 35% of the way from shoulder to hip — roughly the narrowest
+    # point of the torso. There is no direct waist landmark so contour
+    # scanning is the primary width source; landmark-derived hip width × 0.9
+    # is used as a fallback. A 16% correction accounts for the waist being
+    # narrower in a standing photo than it is around the body.
     waist_y = left_shoulder.y + (left_hip.y - left_shoulder.y) * 0.35
     if frame is not None:
         waist_y_px = int(waist_y * image_height)
@@ -202,9 +337,12 @@ def calculate_measurements(landmarks, scale_factor, image_width, image_height, d
         if 0 <= wy_s < 384 and 0 <= wx_s < 384:
             waist_depth_ratio = 1.0 + 0.5 * (1.0 - depth_map[wy_s, wx_s] / np.max(depth_map))
     measurements["waist_width"] = pixel_to_cm(waist_width_px)
-    measurements["waist"] = calculate_circumference(waist_width_px, waist_depth_ratio)
+    measurements["waist"] = calculate_circumference(waist_width_px, waist_depth_ratio * depth_factor)
 
-    # Hip
+    # ── Hip circumference ────────────────────────────────────────────────────
+    # Hip is measured at the hip landmarks with a 35% correction — the widest
+    # point of the hips is broader than the hip joint markers suggest.
+    # Contour scanning 10% below the hip landmark refines the reading.
     hip_width_px = abs(left_hip.x * image_width - right_hip.x * image_width) * 1.35
     if frame is not None:
         hip_y = left_hip.y + (landmarks[PoseLandmark.LEFT_KNEE].y - left_hip.y) * 0.1
@@ -222,23 +360,32 @@ def calculate_measurements(landmarks, scale_factor, image_width, image_height, d
         if 0 <= hy_s < 384 and 0 <= hx_s < 384:
             hip_depth_ratio = 1.0 + 0.5 * (1.0 - depth_map[hy_s, hx_s] / np.max(depth_map))
     measurements["hip_width"] = pixel_to_cm(hip_width_px)
-    measurements["hip"] = calculate_circumference(hip_width_px, hip_depth_ratio)
+    measurements["hip"] = calculate_circumference(hip_width_px, hip_depth_ratio * depth_factor)
 
-    # Neck
+    # ── Neck circumference ───────────────────────────────────────────────────
+    # No dedicated neck landmark — approximated from nose to left ear × 2
+    # to estimate the full neck diameter. Depth factor not applied here
+    # as neck depth does not correlate strongly with BMI.
     neck = landmarks[PoseLandmark.NOSE]
     left_ear = landmarks[PoseLandmark.LEFT_EAR]
     neck_width_px = abs(neck.x * image_width - left_ear.x * image_width) * 2.0
     measurements["neck"] = calculate_circumference(neck_width_px, 1.0)
     measurements["neck_width"] = pixel_to_cm(neck_width_px)
 
-    # Arm length
+    # ── Arm (sleeve) length ──────────────────────────────────────────────────
+    # Vertical pixel distance from shoulder to wrist landmark.
     left_wrist = landmarks[PoseLandmark.LEFT_WRIST]
     measurements["arm_length"] = pixel_to_cm(abs(left_shoulder.y * image_height - left_wrist.y * image_height))
 
-    # Shirt length
+    # ── Shirt length ─────────────────────────────────────────────────────────
+    # Shoulder to hip × 1.2 to account for the shirt hem sitting below the hip.
     measurements["shirt_length"] = pixel_to_cm(abs(left_shoulder.y * image_height - left_hip.y * image_height) * 1.2)
 
-    # Thigh
+    # ── Thigh circumference ──────────────────────────────────────────────────
+    # Thigh is at 20% of the way from hip to knee.
+    # Base width starts at 50% of hip width × 1.2 correction.
+    # Contour scanning refines it; the sanity check (< hip_width_px) prevents
+    # picking up the full hip contour instead of just one thigh.
     left_knee = landmarks[PoseLandmark.LEFT_KNEE]
     thigh_y = left_hip.y + (left_knee.y - left_hip.y) * 0.2
     thigh_width_px = hip_width_px * 0.5 * 1.2
@@ -256,9 +403,10 @@ def calculate_measurements(landmarks, scale_factor, image_width, image_height, d
         if 0 <= ty_s < 384 and 0 <= tx_s < 384:
             thigh_depth_ratio = 1.0 + 0.5 * (1.0 - depth_map[ty_s, tx_s] / np.max(depth_map))
     measurements["thigh"] = pixel_to_cm(thigh_width_px)
-    measurements["thigh_circumference"] = calculate_circumference(thigh_width_px, thigh_depth_ratio)
+    measurements["thigh_circumference"] = calculate_circumference(thigh_width_px, thigh_depth_ratio * depth_factor)
 
-    # Trouser length
+    # ── Trouser length ───────────────────────────────────────────────────────
+    # Vertical distance from hip landmark to ankle landmark.
     left_ankle = landmarks[PoseLandmark.LEFT_ANKLE]
     measurements["trouser_length"] = pixel_to_cm(abs(left_hip.y * image_height - left_ankle.y * image_height))
 
@@ -266,6 +414,15 @@ def calculate_measurements(landmarks, scale_factor, image_width, image_height, d
 
 
 def validate_front_image(image_np):
+    """
+    Validates the front image before processing.
+    Checks:
+      1. A person is detected at all.
+      2. All key upper + lower body landmarks are visible and within frame.
+      3. The photo is not a face selfie (shoulder width must be wide enough
+         relative to head size).
+    Returns (is_valid: bool, message: str).
+    """
     try:
         image_height, image_width = image_np.shape[:2]
         landmarks = _detect(image_np)
@@ -293,6 +450,8 @@ def validate_front_image(image_np):
         if missing_upper:
             return False, "Couldn't detect full body. Please make sure your full body is visible."
 
+        # Selfie check: if shoulder width is narrower than the nose-to-shoulder
+        # vertical distance, the person is likely too close to the camera.
         nose = landmarks[PoseLandmark.NOSE]
         left_shoulder = landmarks[PoseLandmark.LEFT_SHOULDER]
         right_shoulder = landmarks[PoseLandmark.RIGHT_SHOULDER]
@@ -305,32 +464,68 @@ def validate_front_image(image_np):
         return True, "Validation passed - proceeding with measurements"
 
     except Exception as e:
-        print(f"Error validating body image: {e}")
+        log.error("Error validating body image: %s", e)
         return False, "You aren't providing images correctly. Please try again."
+
+
+# ── Routes ───────────────────────────────────────────────────────────────────
+
+@app.errorhandler(413)
+def request_too_large(e):
+    return jsonify({"error": "Upload too large. Maximum total size is 25 MB."}), 413
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    log.error("Unhandled server error: %s", e)
+    return jsonify({"error": "An unexpected error occurred."}), 500
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
 
 
 @app.route("/upload_images", methods=["POST"])
 def upload_images():
-    if "front" not in request.files:
-        return jsonify({"error": "Missing front image for reference."}), 400
+    """
+    Main measurement endpoint.
+
+    Expected form fields:
+      front      (file, required)   — front-facing full-body photo
+      left_side  (file, required)   — side-on full-body photo
+      height_cm  (float, required)  — user's height in centimetres
+      weight_kg  (float, optional)  — user's weight in kilograms (improves circumferences)
+
+    Returns JSON:
+      measurements  — dict of measurement keys → values in cm
+      debug_info    — scale factor, focal length, and input parameters used
+    """
+    if "front" not in request.files or "left_side" not in request.files:
+        return jsonify({"error": "Both front and side images are required."}), 400
 
     front_image_file = request.files["front"]
     front_image_np = np.frombuffer(front_image_file.read(), np.uint8)
     front_image_file.seek(0)
 
+    # Validate the front image before doing any heavy processing
     is_valid, error_msg = validate_front_image(cv2.imdecode(front_image_np, cv2.IMREAD_COLOR))
     if not is_valid:
         return jsonify({"error": error_msg, "pose": "front", "code": "INVALID_POSE"}), 400
 
-    user_height_cm = request.form.get('height_cm')
-    print(user_height_cm)
-    if user_height_cm:
-        try:
-            user_height_cm = float(user_height_cm)
-        except ValueError:
-            user_height_cm = DEFAULT_HEIGHT_CM
-    else:
+    # Parse height — required for accurate scale calibration
+    try:
+        user_height_cm = float(request.form.get('height_cm') or DEFAULT_HEIGHT_CM)
+    except ValueError:
         user_height_cm = DEFAULT_HEIGHT_CM
+
+    # Parse weight — required, used to adjust circumference depth ratios via BMI
+    try:
+        user_weight_kg = float(request.form.get('weight_kg'))
+        if not user_weight_kg:
+            return jsonify({"error": "Weight is required."}), 400
+    except (TypeError, ValueError):
+        return jsonify({"error": "Weight is required."}), 400
 
     received_images = {
         pose_name: request.files[pose_name]
@@ -348,29 +543,35 @@ def upload_images():
         lms = _detect(frame)
         image_height, image_width, _ = frame.shape
 
+        # Calibrate scale from front image only — side image is used for
+        # depth context but not for primary landmark-based measurements.
         if pose_name == "front":
             if lms is not None:
                 _, scale_factor = calculate_distance_using_height(lms, image_height, user_height_cm)
             else:
+                # Fallback: derive scale from the largest detected contour
                 scale_factor, focal_length = detect_reference_object(frame)
 
+        # Run MiDaS depth estimation on both front and side images
         depth_map = estimate_depth(frame) if pose_name in ["front", "left_side"] else None
 
+        # Only compute measurements from the front image — side is reserved
+        # for future multi-view fusion improvements
         if lms is not None and pose_name == "front":
             measurements.update(calculate_measurements(
-                lms, scale_factor, image_width, image_height, depth_map, frame, user_height_cm
+                lms, scale_factor, image_width, image_height, depth_map, frame, user_height_cm, user_weight_kg
             ))
 
     debug_info = {
         "scale_factor": float(scale_factor) if scale_factor else None,
         "focal_length": float(focal_length),
-        "user_height_cm": float(user_height_cm)
+        "user_height_cm": float(user_height_cm),
+        "user_weight_kg": float(user_weight_kg) if user_weight_kg else None
     }
 
-    print(measurements)
-
-    return jsonify({"measurements": measurements, "debug_info": debug_info})
+    return jsonify({"measurements": {k: float(v) for k, v in measurements.items()}, "debug_info": debug_info})
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    # Development only — production uses gunicorn (see Dockerfile)
+    app.run(host='0.0.0.0', port=5000, debug=False)

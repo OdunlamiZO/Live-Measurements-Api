@@ -34,4 +34,6 @@ urllib.request.urlretrieve(\
 
 EXPOSE 5000
 
-CMD ["python", "app.py"]
+# 1 worker — each worker loads the ML models into memory, so more workers
+# means proportionally more RAM. Timeout raised to 120s for inference time.
+CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-"]
