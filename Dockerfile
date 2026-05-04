@@ -9,25 +9,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     libxrender1 \
-    libportaudio2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 
-# Install PyTorch CPU-only first (avoids pulling the 2 GB CUDA build)
-RUN pip install --no-cache-dir \
-    torch==2.6.0 \
-    torchvision==0.21.0 \
-    --index-url https://download.pytorch.org/whl/cpu
-
-# Install the rest, skipping torch/torchvision (already installed above)
-RUN grep -vE "^torch==|^torchvision==" requirements.txt \
-    | pip install --no-cache-dir -r /dev/stdin
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Pre-download the pose model at build time so the container starts instantly
 RUN python -c "\
-import urllib.request, os; \
+import urllib.request; \
 urllib.request.urlretrieve(\
 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task',\
 'pose_landmarker_heavy.task')"

@@ -1,9 +1,5 @@
 Flask==3.1.0
-Flask-Cors==5.0.0
 gunicorn==23.0.0
 mediapipe==0.10.35
 numpy
 opencv-python==4.11.0.86
-timm
-torch==2.6.0
-torchvision==0.21.0

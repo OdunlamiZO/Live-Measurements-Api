@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 pose_landmarker_heavy.task
+selfie_segmenter.tflite
