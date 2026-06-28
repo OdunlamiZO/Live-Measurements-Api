@@ -8,14 +8,38 @@ from flask import Flask, request, jsonify
 import urllib.request
 import os
 
+if os.environ.get("LOG_FORMAT") == "json":
+    from pythonjsonlogger import jsonlogger
+    handler = logging.StreamHandler()
+    handler.setFormatter(jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+        rename_fields={"asctime": "timestamp", "levelname": "level", "name": "logger"},
+    ))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+else:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
-logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
 # Limit uploads to 25 MB per request (two full-res phone photos)
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
+
+
+# ── Scan guidelines ───────────────────────────────────────────────────────────
+# Returned with validation errors so the client can display them to the user.
+SCAN_GUIDELINES = [
+    "Wear fitted clothing — no oversized, loose, or flowing garments",
+    "Stand against a plain, uncluttered background",
+    "Ensure good, even lighting with no harsh shadows",
+    "Show your full body from head to toe",
+    "Keep your arms slightly away from your body",
+    "Hold the camera at waist or chest height",
+    "Do not use mirror selfies",
+    "Stand straight and face the camera directly (front photo)",
+    "Stand sideways with arms at your sides (side photo)",
+]
 
 
 # ── Landmark indices ──────────────────────────────────────────────────────────
@@ -55,6 +79,25 @@ _landmarker = mp_vision.PoseLandmarker.create_from_options(
         min_pose_detection_confidence=0.5,
         min_pose_presence_confidence=0.5,
         min_tracking_confidence=0.5,
+    )
+)
+
+SEGMENTER_PATH = "selfie_segmenter.tflite"
+SEGMENTER_URL = (
+    "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
+    "selfie_segmenter/float16/latest/selfie_segmenter.tflite"
+)
+
+if not os.path.exists(SEGMENTER_PATH):
+    log.info("Downloading selfie segmenter model...")
+    urllib.request.urlretrieve(SEGMENTER_URL, SEGMENTER_PATH)
+    log.info("Segmenter model downloaded.")
+
+_segmenter = mp_vision.ImageSegmenter.create_from_options(
+    mp_vision.ImageSegmenterOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=SEGMENTER_PATH),
+        running_mode=mp_vision.RunningMode.IMAGE,
+        output_confidence_masks=True,
     )
 )
 
@@ -102,45 +145,59 @@ def formula_estimates(height_cm, weight_kg, is_female=False):
     }
 
 
-def personal_depth_ratio(waist_circ_cm, waist_width_cm):
+
+def _formula_score(scanned_cm, formula_cm, label):
     """
-    Derives the user's actual front-to-back depth ratio from their known waist.
-
-    From the ellipse formula C = 2π√((a²+b²)/2), where a = half visible width
-    and b = half depth, we can solve for b given C and a:
-      b = √(2(C/2π)² − a²)
-      depth_ratio = b / a
-
-    This personal ratio replaces the fixed population-average depth ratios and
-    significantly improves circumference accuracy for users who provide their waist.
-    Returns None if the value is implausible or the maths doesn't work out.
-    """
-    if not waist_circ_cm or not waist_width_cm or waist_width_cm <= 0:
-        return None
-    a = waist_width_cm / 2
-    val = 2 * (waist_circ_cm / (2 * np.pi)) ** 2 - a ** 2
-    if val <= 0:
-        return None
-    ratio = np.sqrt(val) / a
-    # Human torso depth ratio sits between 0.30 (very slim) and 1.0 (very full)
-    return ratio if 0.30 <= ratio <= 1.0 else None
-
-
-def formula_guard(scanned_cm, formula_cm, label):
-    """
-    Returns scanned_cm if it is within 20% of the formula estimate,
-    otherwise returns the formula estimate and logs a warning.
+    Returns (confidence_penalty, warning_or_None).
+    Does NOT replace the scanned value — deviation reduces confidence and adds a warning.
     """
     if formula_cm <= 0:
-        return scanned_cm
+        return 0.0, None
     deviation = abs(scanned_cm - formula_cm) / formula_cm
-    if deviation > 0.20:
-        log.warning(
-            "%s scan (%.1f cm) deviates %.0f%% from formula (%.1f cm) — using formula",
-            label, scanned_cm, deviation * 100, formula_cm,
-        )
-        return formula_cm
-    return scanned_cm
+    log.info("Formula check %s: scanned=%.1f, formula=%.1f, deviation=%.0f%%",
+             label, scanned_cm, formula_cm, deviation * 100)
+    if deviation <= 0.10:
+        return 0.0, None
+    elif deviation <= 0.20:
+        return 0.10, f"{label.capitalize()} is {deviation*100:.0f}% outside the expected range"
+    elif deviation <= 0.35:
+        return 0.20, f"{label.capitalize()} deviates {deviation*100:.0f}% from expected — possible clothing interference"
+    else:
+        return 0.35, f"{label.capitalize()} deviates {deviation*100:.0f}% from expected — result may be unreliable"
+
+
+def _mask_quality(mask, image_h, image_w):
+    """Returns (confidence_penalty, warning_or_None) based on segmentation mask coverage."""
+    if mask is None:
+        return 0.15, "Segmentation unavailable — gradient detection used"
+    person_ratio = mask.sum() / (image_h * image_w)
+    if 0.12 <= person_ratio <= 0.70:
+        return 0.0, None
+    elif person_ratio < 0.12:
+        return 0.10, "Person appears small in frame — step closer for better accuracy"
+    else:
+        return 0.10, "Background complexity may affect boundary detection"
+
+
+def _landmark_score(landmarks, indices):
+    """Returns (confidence_penalty, warning_or_None) based on landmark visibility."""
+    visibilities = [getattr(landmarks[i], 'visibility', 1.0) for i in indices]
+    avg = sum(visibilities) / len(visibilities)
+    if avg >= 0.75:
+        return 0.0, None
+    elif avg >= 0.55:
+        return 0.10, "Reduced landmark visibility — measurement may be less precise"
+    else:
+        return 0.25, "Low landmark visibility — measurement confidence is reduced"
+
+
+def _build_measurement(value, penalties, warnings):
+    """Assembles the final measurement dict, clamping confidence to [0, 1]."""
+    return {
+        "value": round(float(value), 1),
+        "confidence": round(max(0.0, min(1.0, 1.0 - sum(penalties))), 2),
+        "warnings": [w for w in warnings if w],
+    }
 
 
 # ── Anatomical depth ratios ───────────────────────────────────────────────────
@@ -157,12 +214,169 @@ DEPTH_RATIOS = {
 }
 
 
+# ── Image helpers ─────────────────────────────────────────────────────────────
+
+def decode_image(file_storage):
+    """Decode an uploaded file into a BGR numpy array. Returns None on failure."""
+    buf = np.frombuffer(file_storage.read(), np.uint8)
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+
+def get_segmentation_mask(frame, threshold=0.5):
+    """
+    Returns a binary uint8 mask (1=person, 0=background) using MediaPipe
+    Selfie Segmentation, or None if segmentation fails.
+
+    Morphological closing fills small holes inside the silhouette (gaps between
+    limbs, clothing texture) and opening removes isolated noise pixels outside
+    the body. Both improve the accuracy of width measurements taken from the mask.
+    """
+    try:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = _segmenter.segment(mp_img)
+        if not result.confidence_masks:
+            return None
+        confidence = result.confidence_masks[0].numpy_view()
+        mask = (confidence > threshold).astype(np.uint8)
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        open_kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  open_kernel)
+        return mask
+    except Exception as e:
+        log.warning("Segmentation failed: %s — will fall back to gradient scanning", e)
+        return None
+
+
+def width_from_mask(mask, y_px):
+    """
+    Returns body width in pixels at row y_px by finding the leftmost and
+    rightmost person pixel in the segmentation mask.
+
+    Returns 0 if fewer than 5 body pixels are found (noise rejection).
+    """
+    y = min(max(y_px, 0), mask.shape[0] - 1)
+    person_cols = np.where(mask[y, :] > 0)[0]
+    if len(person_cols) < 5:
+        return 0
+    return int(person_cols[-1] - person_cols[0])
+
+
+def is_blurry(frame, threshold=80):
+    """
+    Returns True if the image is too blurry to reliably extract measurements.
+    Uses the variance of the Laplacian — a low variance means little edge
+    detail, which indicates blur. Threshold of 80 rejects noticeably blurry
+    phone photos while accepting typical handheld shots.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var() < threshold
+
+
 def _detect(frame):
     """Run pose detection on a BGR frame. Returns landmarks or None."""
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     result = _landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
     return result.pose_landmarks[0] if result.pose_landmarks else None
 
+
+# ── Validation ────────────────────────────────────────────────────────────────
+
+def validate_front_image(frame):
+    """
+    Validates that the front image is suitable for measurement.
+    Returns (ok: bool, error_message: str, error_code: str | None).
+    """
+    try:
+        if is_blurry(frame):
+            return False, "The front photo is too blurry. Please retake it in good lighting.", "IMAGE_TOO_BLURRY"
+
+        image_height, image_width = frame.shape[:2]
+        landmarks = _detect(frame)
+
+        if landmarks is None:
+            return False, "No person detected in the front photo. Make sure you are clearly visible.", "POSE_NOT_DETECTED"
+
+        required = {
+            PoseLandmark.NOSE: "nose",
+            PoseLandmark.LEFT_SHOULDER: "left shoulder",
+            PoseLandmark.RIGHT_SHOULDER: "right shoulder",
+            PoseLandmark.LEFT_ELBOW: "left elbow",
+            PoseLandmark.RIGHT_ELBOW: "right elbow",
+            PoseLandmark.LEFT_KNEE: "left knee",
+            PoseLandmark.RIGHT_KNEE: "right knee",
+            PoseLandmark.LEFT_ANKLE: "left ankle",
+            PoseLandmark.RIGHT_ANKLE: "right ankle",
+        }
+
+        missing = [
+            name for idx, name in required.items()
+            if getattr(landmarks[idx], 'visibility', 1.0) < 0.5
+            or not (0 <= landmarks[idx].x <= 1 and 0 <= landmarks[idx].y <= 1)
+        ]
+
+        if missing:
+            return False, "Full body not visible in the front photo. Please step back until your entire body is in frame.", "BODY_NOT_VISIBLE"
+
+        ls = landmarks[PoseLandmark.LEFT_SHOULDER]
+        rs = landmarks[PoseLandmark.RIGHT_SHOULDER]
+        shoulder_width = abs(ls.x - rs.x) * image_width
+        head_to_shoulder = abs(ls.y - landmarks[PoseLandmark.NOSE].y) * image_height
+
+        if shoulder_width < head_to_shoulder * 1.2:
+            return False, "You are too close to the camera. Please step back to show your full body.", "TOO_CLOSE"
+
+        return True, "OK", None
+
+    except Exception as e:
+        log.error("Front image validation error: %s", e)
+        return False, "Could not validate the front photo. Please try again.", "VALIDATION_ERROR"
+
+
+def validate_side_image(frame):
+    """
+    Validates that the side image is suitable for depth measurement.
+    Returns (ok: bool, error_message: str, error_code: str | None).
+
+    In a side profile, MediaPipe still detects landmarks but shoulder width
+    will appear narrow. We check that the body is fully visible and not blurry
+    rather than trying to distinguish left-from-right profile orientation.
+    """
+    try:
+        if is_blurry(frame):
+            return False, "The side photo is too blurry. Please retake it in good lighting.", "IMAGE_TOO_BLURRY"
+
+        image_height, image_width = frame.shape[:2]
+        landmarks = _detect(frame)
+
+        if landmarks is None:
+            return False, "No person detected in the side photo. Make sure you are clearly visible from the side.", "POSE_NOT_DETECTED"
+
+        # In a true side profile at least one shoulder, hip, knee, and ankle must be visible.
+        side_required = {
+            PoseLandmark.LEFT_SHOULDER: "shoulder",
+            PoseLandmark.LEFT_HIP: "hip",
+            PoseLandmark.LEFT_KNEE: "knee",
+            PoseLandmark.LEFT_ANKLE: "ankle",
+        }
+
+        missing = [
+            name for idx, name in side_required.items()
+            if getattr(landmarks[idx], 'visibility', 1.0) < 0.4
+        ]
+
+        if len(missing) > 1:
+            return False, "Full body not visible in the side photo. Please step back until your entire body is in frame.", "BODY_NOT_VISIBLE"
+
+        return True, "OK", None
+
+    except Exception as e:
+        log.error("Side image validation error: %s", e)
+        return False, "Could not validate the side photo. Please try again.", "VALIDATION_ERROR"
+
+
+# ── Measurement helpers ───────────────────────────────────────────────────────
 
 def scale_from_height(landmarks, image_height, height_cm):
     """
@@ -179,6 +393,85 @@ def scale_from_height(landmarks, image_height, height_cm):
     if height_px < 1:
         return height_cm / image_height
     return (height_cm * 1.07) / height_px
+
+
+def extract_side_depths(side_frame, side_lm, height_cm, side_mask=None):
+    """
+    Scans the side image at key anatomical levels to measure real front-to-back
+    body depth in cm. Returns a dict of {label: depth_cm | None}.
+
+    The horizontal "width" seen in a side-profile image at a given height is the
+    body's front-to-back depth. We reuse get_body_width_at_height with a center_x
+    derived from the mean of all well-visible landmarks, and a max search radius
+    capped at 30 cm (generous upper bound for human body depth half).
+
+    Any result outside [12, 50] cm is discarded — those bounds cover virtually all
+    human body depths and filter out scan failures or background bleed.
+    """
+    side_h, side_w = side_frame.shape[:2]
+    scale = scale_from_height(side_lm, side_h, height_cm)
+
+    ls = side_lm[PoseLandmark.LEFT_SHOULDER]
+    lh = side_lm[PoseLandmark.LEFT_HIP]
+    lk = side_lm[PoseLandmark.LEFT_KNEE]
+
+    # Center x: mean of well-visible landmarks — gives a point in the middle of
+    # the body depth-wise regardless of which way the person is facing.
+    visible_xs = [
+        side_lm[i].x for i in range(33)
+        if getattr(side_lm[i], 'visibility', 0) > 0.4 and 0 <= side_lm[i].x <= 1
+    ]
+    center_x = sum(visible_xs) / len(visible_xs) if visible_xs else 0.5
+
+    # Cap search at 30 cm each side — no human body is deeper than ~60 cm total.
+    max_half_px = int(30 / scale)
+
+    def scan_depth(y_norm, label):
+        y_px = int(y_norm * side_h)
+        if side_mask is not None:
+            depth_px = width_from_mask(side_mask, y_px)
+            method = "mask"
+        else:
+            depth_px = get_body_width_at_height(side_frame, y_px, center_x, max_half_px)
+            method = "gradient"
+        if depth_px <= 0:
+            log.warning("Side depth scan returned nothing for %s [%s]", label, method)
+            return None
+        depth_cm = round(depth_px * scale, 2)
+        if not (12 <= depth_cm <= 50):
+            log.warning("Side depth %s=%.1f cm outside plausible range [12, 50] — discarding [%s]", label, depth_cm, method)
+            return None
+        log.info("Side depth %s=%.1f cm (px=%d, scale=%.4f cm/px) [%s]", label, depth_cm, depth_px, scale, method)
+        return depth_cm
+
+    return {
+        "chest":  scan_depth(ls.y + (lh.y - ls.y) * 0.20, "chest"),
+        "waist":  scan_depth(ls.y + (lh.y - ls.y) * 0.55, "waist"),
+        "hip":    scan_depth(ls.y + (lh.y - ls.y) * 0.85, "hip"),
+        "thigh":  scan_depth(lh.y  + (lk.y - lh.y) * 0.25, "thigh"),
+    }
+
+
+def _resolve_depth_ratio(label, front_width_cm, side_depths, fallback_ratio):
+    """
+    Picks the best available depth ratio for a circumference calculation.
+
+    Priority:
+      1. Actual measured side depth (most accurate)
+      2. Population-average fallback
+
+    The side depth is converted to a ratio (depth / front_width) so the existing
+    ellipse_circumference interface is unchanged. Ratios outside [0.25, 1.20] are
+    rejected — that range covers all realistic human body proportions.
+    """
+    if side_depths and side_depths.get(label) and front_width_cm > 0:
+        ratio = side_depths[label] / front_width_cm
+        if 0.25 <= ratio <= 1.20:
+            log.info("Depth %s: using side image ratio %.3f (%.1f cm depth / %.1f cm width)",
+                     label, ratio, side_depths[label], front_width_cm)
+            return ratio
+        log.warning("Side depth ratio %.2f for %s out of plausible range — falling back", ratio, label)
+    return fallback_ratio
 
 
 def get_body_width_at_height(frame, height_px, center_x, max_half_px):
@@ -240,19 +533,19 @@ def ellipse_circumference(width_cm, depth_ratio):
     return round(2 * np.pi * np.sqrt((a ** 2 + b ** 2) / 2), 2)
 
 
-def calculate_measurements(landmarks, scale_factor, image_width, image_height, frame, user_height_cm, weight_kg, is_female=False, known_waist_cm=None):
+def calculate_measurements(landmarks, scale_factor, image_width, image_height, frame, user_height_cm, weight_kg, is_female=False, known_waist_cm=None, side_depths=None, front_mask=None):
     """
     Derives all body measurements from pose landmarks and pixel scanning.
 
-    Width at each anatomical level is measured by scanning outward from the
-    body centre in the front image. Landmark-derived widths are used as a
-    fallback when scanning fails.
+    Returns a dict of structured measurements, each with:
+      value       — measurement in cm
+      confidence  — 0.0 (unreliable) to 1.0 (highly reliable)
+      warnings    — list of human-readable issue descriptions
 
-    Circumferences use the ellipse approximation with anatomical depth ratios
-    instead of MiDaS-estimated depth. MiDaS returned relative depth values
-    that, when applied to the original formula (width × depth_ratio × 0.7),
-    produced depths up to 105% of body width — far exceeding real anatomy
-    (45–60%) and inflating all circumferences by ~50%.
+    Width scanning uses the segmentation mask when available, falling back to
+    gradient detection. Depth comes from the side image, falling back to
+    population-average anatomical ratios. Formula estimates reduce confidence
+    when deviation is high but never silently replace the measured value.
     """
     ls = landmarks[PoseLandmark.LEFT_SHOULDER]
     rs = landmarks[PoseLandmark.RIGHT_SHOULDER]
@@ -269,157 +562,180 @@ def calculate_measurements(landmarks, scale_factor, image_width, image_height, f
         return round(px * scale_factor, 2)
 
     torso_cx = (ls.x + rs.x + lh.x + rh.x) / 4
-
-    # Raw landmark spans (no correction factor) used as reference bounds.
-    # Scan results wider than these bounds are landmark-derived overestimates
-    # caused by background bleed, and must be rejected.
     shoulder_span_px = abs(ls.x - rs.x) * image_width
-    hip_span_px = abs(lh.x - rh.x) * image_width
+    hip_span_px      = abs(lh.x - rh.x) * image_width
+    torso_half_px    = int(max(shoulder_span_px, hip_span_px) / 2 * 1.30)
 
-    # Max search radius for each scan: landmark span + 30% margin
-    torso_half_px = int(max(shoulder_span_px, hip_span_px) / 2 * 1.30)
+    # ── Shared quality signals (applied to all scanned measurements) ──────────
+    mask_penalty, mask_warn = _mask_quality(front_mask, image_height, image_width)
 
     def scan_and_validate(y_ratio, max_ratio, fallback_px, label=""):
-        """
-        Scan body width at a given y-ratio. Reject results wider than
-        shoulder_span × max_ratio (catches background bleed) and fall
-        back to the landmark estimate if the scan fails or is implausible.
-        """
+        """Returns (px, used_fallback). Uses mask when available, else gradient."""
         y_px = int((ls.y + (lh.y - ls.y) * y_ratio) * image_height)
-        scanned = get_body_width_at_height(frame, y_px, torso_cx, torso_half_px)
-        log.info("Scan %s y_ratio=%.2f → scanned=%dpx (%.1fcm), cap=%dpx, fallback=%dpx",
-                 label, y_ratio, scanned, scanned * scale_factor,
-                 int(shoulder_span_px * max_ratio), fallback_px)
+        if front_mask is not None:
+            scanned = width_from_mask(front_mask, y_px)
+            method = "mask"
+        else:
+            scanned = get_body_width_at_height(frame, y_px, torso_cx, torso_half_px)
+            method = "gradient"
+        log.info("Scan %s y_ratio=%.2f → %dpx (%.1fcm) [%s]",
+                 label, y_ratio, scanned, scanned * scale_factor, method)
         if 0 < scanned <= shoulder_span_px * max_ratio:
-            return scanned
-        return fallback_px
+            return scanned, False
+        return fallback_px, True
+
+    def circ_measurement(label, front_w_cm, depth_ratio, formula_cm, lm_indices, fallback_used, no_side_depth):
+        """Builds a confidence-scored circumference measurement."""
+        value = ellipse_circumference(front_w_cm, depth_ratio)
+        penalties, warnings = [mask_penalty], [mask_warn]
+
+        if fallback_used:
+            penalties.append(0.20)
+            warnings.append(f"{label.capitalize()} width scan failed — landmark estimate used")
+
+        if no_side_depth:
+            penalties.append(0.10)
+            warnings.append(f"Side depth unavailable for {label} — population average used")
+
+        lm_p, lm_w = _landmark_score(landmarks, lm_indices)
+        penalties.append(lm_p)
+        warnings.append(lm_w)
+
+        f_p, f_w = _formula_score(value, formula_cm, label)
+        penalties.append(f_p)
+        warnings.append(f_w)
+
+        return _build_measurement(value, penalties, warnings)
 
     formula = formula_estimates(user_height_cm, weight_kg, is_female)
-
     m = {}
 
-    # ── Shoulder ──────────────────────────────────────────────────────────────
+    # ── Shoulder width ────────────────────────────────────────────────────────
     shoulder_px = shoulder_span_px * 1.19
-    m["shoulder_width"] = to_cm(shoulder_px)
+    lm_p, lm_w = _landmark_score(landmarks, [PoseLandmark.LEFT_SHOULDER, PoseLandmark.RIGHT_SHOULDER])
+    m["shoulder_width"] = _build_measurement(to_cm(shoulder_px), [lm_p], [lm_w])
 
-    # ── Waist width (needed early for personal depth ratio) ───────────────────
+    # ── Waist width (scanned early — needed for depth resolution) ────────────
     waist_fallback = hip_span_px * 1.24
-    waist_w_px = scan_and_validate(0.55, 0.95, waist_fallback, "waist")
+    waist_w_px, waist_fallback_used = scan_and_validate(0.55, 0.95, waist_fallback, "waist")
     waist_w_cm = to_cm(waist_w_px)
-
-    # If the user provided their actual waist, derive a personal depth ratio.
-    # This replaces the fixed population-average ratio with a value calibrated
-    # to their specific body shape, reducing circumference error from ±15% to ±5%.
-    calibrated_ratio = personal_depth_ratio(known_waist_cm, waist_w_cm)
-    if calibrated_ratio:
-        log.info("Using personal depth ratio %.3f (from known waist %.1f cm)", calibrated_ratio, known_waist_cm)
-        depth_chest = calibrated_ratio * 1.10  # chest is slightly deeper relative to width than waist
-        depth_waist = calibrated_ratio
-        depth_hip   = calibrated_ratio * 1.10
-        depth_thigh = calibrated_ratio * 1.30  # thighs more cylindrical
-    else:
-        depth_chest = DEPTH_RATIOS["chest"]
-        depth_waist = DEPTH_RATIOS["waist"]
-        depth_hip   = DEPTH_RATIOS["hip"]
-        depth_thigh = DEPTH_RATIOS["thigh"]
 
     # ── Chest / bust ──────────────────────────────────────────────────────────
     chest_fallback = shoulder_span_px * 0.98
-    chest_w_px = scan_and_validate(0.20, 1.10, chest_fallback, "chest")
-    chest_circ = ellipse_circumference(to_cm(chest_w_px), depth_chest)
-    chest_circ = formula_guard(chest_circ, formula["chest"], "chest")
-    m["chest_circumference"] = chest_circ
+    chest_w_px, chest_fallback_used = scan_and_validate(0.20, 1.10, chest_fallback, "chest")
+    chest_w_cm = to_cm(chest_w_px)
+    depth_chest   = _resolve_depth_ratio("chest", chest_w_cm, side_depths, DEPTH_RATIOS["chest"])
+    no_side_chest = not (side_depths and side_depths.get("chest"))
+    m["chest_circumference"] = circ_measurement(
+        "chest", chest_w_cm, depth_chest, formula["chest"],
+        [PoseLandmark.LEFT_SHOULDER, PoseLandmark.RIGHT_SHOULDER],
+        chest_fallback_used, no_side_chest,
+    )
 
     # ── Waist ─────────────────────────────────────────────────────────────────
-    waist_circ = known_waist_cm if known_waist_cm else ellipse_circumference(waist_w_cm, depth_waist)
-    if not known_waist_cm:
-        waist_circ = formula_guard(waist_circ, formula["waist"], "waist")
-    m["waist"] = waist_circ
+    depth_waist = _resolve_depth_ratio("waist", waist_w_cm, side_depths, DEPTH_RATIOS["waist"])
+    if known_waist_cm:
+        # User-provided: treat as ground truth
+        m["waist"] = _build_measurement(known_waist_cm, [], ["User-provided waist measurement used"])
+        m["waist"]["confidence"] = 1.0
+    else:
+        no_side_waist = not (side_depths and side_depths.get("waist"))
+        m["waist"] = circ_measurement(
+            "waist", waist_w_cm, depth_waist, formula["waist"],
+            [PoseLandmark.LEFT_HIP, PoseLandmark.RIGHT_HIP],
+            waist_fallback_used, no_side_waist,
+        )
 
     # ── Hip ───────────────────────────────────────────────────────────────────
-    hip_w_px = hip_span_px * 1.55
-    hip_circ = ellipse_circumference(to_cm(hip_w_px), depth_hip)
-    hip_circ = formula_guard(hip_circ, formula["hip"], "hip")
-    if hip_circ < waist_circ:
-        hip_circ = waist_circ * 1.05
-    m["hip"] = hip_circ
+    hip_w_cm    = to_cm(hip_span_px * 1.55)
+    depth_hip   = _resolve_depth_ratio("hip", hip_w_cm, side_depths, DEPTH_RATIOS["hip"])
+    no_side_hip = not (side_depths and side_depths.get("hip"))
+    hip_result  = circ_measurement(
+        "hip", hip_w_cm, depth_hip, formula["hip"],
+        [PoseLandmark.LEFT_HIP, PoseLandmark.RIGHT_HIP],
+        False, no_side_hip,  # hip uses landmark span directly, not scan_and_validate
+    )
+    # Anatomical constraint: hip >= waist
+    if hip_result["value"] < m["waist"]["value"]:
+        hip_result["value"] = round(m["waist"]["value"] * 1.05, 1)
+        hip_result["confidence"] = round(max(0.0, hip_result["confidence"] - 0.10), 2)
+        hip_result["warnings"].append("Hip adjusted to exceed waist — landmark positions may be inaccurate")
+    m["hip"] = hip_result
 
     # ── Thigh ─────────────────────────────────────────────────────────────────
     thigh_y_px = int((lh.y + (lk.y - lh.y) * 0.25) * image_height)
-    full_thigh_px = get_body_width_at_height(frame, thigh_y_px, torso_cx, torso_half_px)
-    if 0 < full_thigh_px <= shoulder_span_px * 1.10:
-        thigh_w_cm = to_cm(full_thigh_px // 2)
+    if front_mask is not None:
+        full_thigh_px = width_from_mask(front_mask, thigh_y_px)
     else:
-        thigh_w_cm = to_cm(hip_span_px * 0.72)
-    m["thigh_circumference"] = ellipse_circumference(thigh_w_cm, depth_thigh)
+        full_thigh_px = get_body_width_at_height(frame, thigh_y_px, torso_cx, torso_half_px)
+    thigh_fallback_used = not (0 < full_thigh_px <= shoulder_span_px * 1.10)
+    thigh_w_cm = to_cm(hip_span_px * 0.72) if thigh_fallback_used else to_cm(full_thigh_px // 2)
+    depth_thigh   = _resolve_depth_ratio("thigh", thigh_w_cm, side_depths, DEPTH_RATIOS["thigh"])
+    no_side_thigh = not (side_depths and side_depths.get("thigh"))
+    m["thigh_circumference"] = circ_measurement(
+        "thigh", thigh_w_cm, depth_thigh, 0,  # no population formula for thigh
+        [PoseLandmark.LEFT_HIP, PoseLandmark.LEFT_KNEE],
+        thigh_fallback_used, no_side_thigh,
+    )
 
     # ── Neck ──────────────────────────────────────────────────────────────────
-    neck_px = abs(nose.x - left_ear.x) * image_width * 2.0
-    m["neck"] = ellipse_circumference(to_cm(neck_px), DEPTH_RATIOS["neck"])
+    # Derived from nose-to-ear distance — inherently approximate; base penalty 0.25
+    neck_px  = abs(nose.x - left_ear.x) * image_width * 2.0
+    neck_val = ellipse_circumference(to_cm(neck_px), DEPTH_RATIOS["neck"])
+    lm_p, lm_w = _landmark_score(landmarks, [PoseLandmark.NOSE, PoseLandmark.LEFT_EAR])
+    m["neck"] = _build_measurement(neck_val, [0.25, lm_p], [lm_w])
 
-    # ── Sleeve length ─────────────────────────────────────────────────────────
-    # Euclidean distance from shoulder to wrist — accounts for the arm being
-    # angled out from the body. Vertical-only underestimates when arms are not
-    # hanging perfectly straight.
+    # ── Arm length ────────────────────────────────────────────────────────────
+    # Euclidean shoulder-to-wrist distance accounts for the arm being angled out.
     sleeve_dy = abs(ls.y - lw.y) * image_height
     sleeve_dx = abs(ls.x - lw.x) * image_width
-    m["arm_length"] = to_cm(np.sqrt(sleeve_dx ** 2 + sleeve_dy ** 2))
+    arm_val   = to_cm(np.sqrt(sleeve_dx ** 2 + sleeve_dy ** 2))
+    lm_p, lm_w = _landmark_score(landmarks, [PoseLandmark.LEFT_SHOULDER, PoseLandmark.LEFT_WRIST])
+    m["arm_length"] = _build_measurement(arm_val, [lm_p], [lm_w])
 
     # ── Trouser length ────────────────────────────────────────────────────────
-    # The trouser waistband sits above the hip landmark (iliac crest). Starting
-    # 10% of shoulder-to-hip above the hip landmark approximates the natural
-    # waist / top of trouser.
+    # 10% above hip landmark approximates the natural waistband / top of trouser.
     trouser_start_y = lh.y - (lh.y - ls.y) * 0.10
-    m["trouser_length"] = to_cm(abs(trouser_start_y - max(la.y, ra.y)) * image_height)
+    trouser_val     = to_cm(abs(trouser_start_y - max(la.y, ra.y)) * image_height)
+    lm_p, lm_w = _landmark_score(landmarks, [PoseLandmark.LEFT_HIP, PoseLandmark.LEFT_ANKLE, PoseLandmark.RIGHT_ANKLE])
+    m["trouser_length"] = _build_measurement(trouser_val, [lm_p], [lm_w])
 
     log.info(
-        "Widths (cm): chest=%.1f waist=%.1f hip=%.1f | scale=%.4f cm/px",
-        to_cm(chest_w_px), to_cm(waist_w_px), to_cm(hip_w_px), scale_factor
+        "Measurements complete | chest=%.1fcm (conf=%.2f) waist=%.1fcm (conf=%.2f) hip=%.1fcm (conf=%.2f) | scale=%.4f cm/px",
+        m["chest_circumference"]["value"], m["chest_circumference"]["confidence"],
+        m["waist"]["value"],               m["waist"]["confidence"],
+        m["hip"]["value"],                 m["hip"]["confidence"],
+        scale_factor,
     )
 
     return m
 
 
-def validate_front_image(image_np):
+# ── Response helpers ──────────────────────────────────────────────────────────
+
+def error_response(message, code=400, error_code=None):
+    body = {"error": message}
+    if error_code:
+        body["code"] = error_code
+    return jsonify(body), code
+
+
+def parse_numeric_field(name, min_val, max_val):
+    """
+    Parses a numeric form field and validates it falls within [min_val, max_val].
+    Returns (value, error_response) — error_response is None on success.
+    """
+    raw = request.form.get(name)
     try:
-        image_height, image_width = image_np.shape[:2]
-        landmarks = _detect(image_np)
-
-        if landmarks is None:
-            return False, "No person detected. Please make sure you're clearly visible in the frame."
-
-        required = {
-            PoseLandmark.NOSE: "NOSE",
-            PoseLandmark.LEFT_SHOULDER: "LEFT SHOULDER",
-            PoseLandmark.RIGHT_SHOULDER: "RIGHT SHOULDER",
-            PoseLandmark.LEFT_ELBOW: "LEFT ELBOW",
-            PoseLandmark.RIGHT_ELBOW: "RIGHT ELBOW",
-            PoseLandmark.RIGHT_KNEE: "RIGHT KNEE",
-            PoseLandmark.LEFT_KNEE: "LEFT KNEE",
-        }
-
-        missing = [
-            name for idx, name in required.items()
-            if getattr(landmarks[idx], 'visibility', 1.0) < 0.5
-            or not (0 <= landmarks[idx].x <= 1 and 0 <= landmarks[idx].y <= 1)
-        ]
-
-        if missing:
-            return False, "Couldn't detect full body. Please make sure your full body is visible."
-
-        ls = landmarks[PoseLandmark.LEFT_SHOULDER]
-        rs = landmarks[PoseLandmark.RIGHT_SHOULDER]
-        shoulder_width = abs(ls.x - rs.x) * image_width
-        head_to_shoulder = abs(ls.y - landmarks[PoseLandmark.NOSE].y) * image_height
-
-        if shoulder_width < head_to_shoulder * 1.2:
-            return False, "Please step back to show your full body, not just your face."
-
-        return True, "OK"
-
-    except Exception as e:
-        log.error("Validation error: %s", e)
-        return False, "Could not validate image. Please try again."
+        value = float(raw or 0)
+    except (TypeError, ValueError):
+        return None, error_response(f"{name.replace('_', ' ').capitalize()} must be a number.", error_code=f"INVALID_{name.upper()}")
+    if not (min_val <= value <= max_val):
+        return None, error_response(
+            f"{name.replace('_', ' ').capitalize()} must be between {min_val} and {max_val}.",
+            error_code=f"INVALID_{name.upper()}"
+        )
+    return value, None
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -440,6 +756,12 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.route("/guidelines", methods=["GET"])
+def guidelines():
+    """Returns the scan guidelines the client should display to the user."""
+    return jsonify({"guidelines": SCAN_GUIDELINES})
+
+
 @app.route("/upload_images", methods=["POST"])
 def upload_images():
     """
@@ -447,60 +769,89 @@ def upload_images():
 
     Expected form fields:
       front      (file, required)  — front-facing full-body photo
-      left_side  (file, required)  — side-on full-body photo
+      side       (file, required)  — side-on full-body photo
       height_cm  (float, required) — user's height in centimetres
       weight_kg  (float, required) — user's weight in kilograms
+      gender     (str, required)   — "male" or "female"
+      waist_in   (float, optional) — known waist in inches for depth calibration
     """
     if "front" not in request.files:
-        return jsonify({"error": "A front-facing photo is required."}), 400
+        return error_response("A front-facing photo is required.", error_code="MISSING_FRONT_IMAGE")
 
-    front_bytes = np.frombuffer(request.files["front"].read(), np.uint8)
-    front_frame = cv2.imdecode(front_bytes, cv2.IMREAD_COLOR)
+    if "side" not in request.files:
+        return error_response("A side-on photo is required.", error_code="MISSING_SIDE_IMAGE")
+
+    front_frame = decode_image(request.files["front"])
     if front_frame is None:
-        return jsonify({"error": "Could not read the front image. Please upload a valid photo."}), 400
+        return error_response("Could not read the front photo. Please upload a valid image.", error_code="INVALID_FRONT_IMAGE")
 
-    is_valid, msg = validate_front_image(front_frame)
-    if not is_valid:
-        return jsonify({"error": msg, "code": "INVALID_POSE"}), 400
+    side_frame = decode_image(request.files["side"])
+    if side_frame is None:
+        return error_response("Could not read the side photo. Please upload a valid image.", error_code="INVALID_SIDE_IMAGE")
 
-    try:
-        height_cm = float(request.form.get('height_cm') or 0)
-        if not (100 <= height_cm <= 250):
-            return jsonify({"error": "Height must be between 100 and 250 cm."}), 400
-    except ValueError:
-        return jsonify({"error": "Height must be a number."}), 400
+    ok, msg, code = validate_front_image(front_frame)
+    if not ok:
+        return error_response(msg, error_code=code)
 
-    try:
-        weight_kg = float(request.form.get('weight_kg') or 0)
-        if not (20 <= weight_kg <= 300):
-            return jsonify({"error": "Weight must be between 20 and 300 kg."}), 400
-    except (TypeError, ValueError):
-        return jsonify({"error": "Weight must be a number."}), 400
+    ok, msg, code = validate_side_image(side_frame)
+    if not ok:
+        return error_response(msg, error_code=code)
 
-    front_h, front_w = front_frame.shape[:2]
-    front_lm = _detect(front_frame)
+    height_cm, err = parse_numeric_field("height_cm", 100, 250)
+    if err:
+        return err
 
-    if front_lm is None:
-        return jsonify({"error": "Could not detect pose in front image."}), 400
+    weight_kg, err = parse_numeric_field("weight_kg", 20, 300)
+    if err:
+        return err
 
-    is_female = request.form.get('gender', 'male').lower() == 'female'
+    gender = request.form.get('gender', '').strip().lower()
+    if gender not in ('male', 'female'):
+        return jsonify({'error': 'gender is required and must be male or female'}), 400
+    is_female = gender == 'female'
 
-    # Optional: user's known waist in inches, converted to cm for calibration
     try:
         waist_in = float(request.form.get('waist_in') or 0)
         known_waist_cm = waist_in * 2.54 if 15 <= waist_in <= 80 else None
     except (TypeError, ValueError):
         known_waist_cm = None
 
+    front_h, front_w = front_frame.shape[:2]
+    front_lm = _detect(front_frame)
+
+    if front_lm is None:
+        return error_response("Could not detect pose in the front photo.", error_code="POSE_NOT_DETECTED")
+
+    front_mask = get_segmentation_mask(front_frame)
+    side_mask  = get_segmentation_mask(side_frame)
+
+    if front_mask is None:
+        log.warning("Front segmentation failed — width scanning will use gradient detection")
+    if side_mask is None:
+        log.warning("Side segmentation failed — depth scanning will use gradient detection")
+
+    side_lm = _detect(side_frame)
+    side_depths = extract_side_depths(side_frame, side_lm, height_cm, side_mask) if side_lm else None
+
+    if side_depths is None:
+        log.warning("Side image pose detection failed — depth will use population-average ratios")
+
     scale = scale_from_height(front_lm, front_h, height_cm)
     measurements = calculate_measurements(
         front_lm, scale, front_w, front_h, front_frame,
-        height_cm, weight_kg, is_female, known_waist_cm
+        height_cm, weight_kg, is_female, known_waist_cm, side_depths, front_mask
     )
 
-    log.info("height=%.1f cm, weight=%.1f kg → %s", height_cm, weight_kg or 0, measurements)
+    log.info("height=%.1f cm, weight=%.1f kg | scan complete", height_cm, weight_kg)
 
-    return jsonify({"measurements": {k: float(v) for k, v in measurements.items()}})
+    return jsonify({
+        "measurements": measurements,
+        "scan": {
+            "front_segmentation": front_mask is not None,
+            "side_segmentation":  side_mask is not None,
+            "side_depths": {k: v is not None for k, v in (side_depths or {}).items()},
+        },
+    })
 
 
 if __name__ == '__main__':

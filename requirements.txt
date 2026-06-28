@@ -3,3 +3,4 @@ gunicorn==23.0.0
 mediapipe==0.10.35
 numpy
 opencv-python==4.11.0.86
+python-json-logger==2.0.7
